@@ -6,9 +6,11 @@ import {
   useMicrophonePermissions,
 } from "expo-camera";
 import { LinearGradient } from "expo-linear-gradient";
-import { useRef, useState } from "react";
+import { useLocalSearchParams } from "expo-router";
+import { useEffect, useRef, useState } from "react";
 import {
   Image,
+  Linking,
   Platform,
   StyleSheet,
   Text,
@@ -23,39 +25,108 @@ const COLORS = {
   pill: "#E4DCFA",
   textDark: "#2A1B6B",
   orange: "#FF8A00",
-  record: "#FFB35C",
   white: "#FFFFFF",
-  navy: "#1B2459",
-  navyDeep: "#3B3A8C",
-  purple: "#6F4BFF",
+  success: "#22C55E",
+  muted: "#6B7280",
+  mutedLight: "#9CA3AF",
 };
+
+/* Formate un nombre de secondes en MM:SS (ou HH:MM:SS si >= 1h) */
+function formatTime(totalSeconds: number) {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${pad(h)}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+}
+
+/* Ligne d'état d'une permission */
+function PermissionRow({
+  icon,
+  label,
+  granted,
+  isLast,
+}: {
+  icon: keyof typeof Ionicons.glyphMap;
+  label: string;
+  granted: boolean;
+  isLast?: boolean;
+}) {
+  return (
+    <View style={[styles.permRow, !isLast && styles.permRowBorder]}>
+      <Ionicons name={icon} size={22} color={COLORS.primary} />
+      <Text style={styles.permLabel}>{label}</Text>
+      <Ionicons
+        name={granted ? "checkmark-circle" : "ellipse-outline"}
+        size={22}
+        color={granted ? COLORS.success : COLORS.mutedLight}
+      />
+    </View>
+  );
+}
 
 export default function HomeScreen() {
   const cameraRef = useRef<CameraView | null>(null);
   const [isRecording, setRecording] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [elapsed, setElapsed] = useState(0); // secondes écoulées depuis le début
   const insets = useSafeAreaInsets();
+
+  // Durée envoyée depuis l'écran d'accueil (en secondes) – absente si "Continuer sans durée"
+  const params = useLocalSearchParams<{ duration?: string | string[] }>();
+  const rawDuration = Array.isArray(params.duration)
+    ? params.duration[0]
+    : params.duration;
+  const parsedDuration = parseInt(rawDuration ?? "0", 10);
+  const duration =
+    Number.isFinite(parsedDuration) && parsedDuration > 0 ? parsedDuration : 0;
+  const hasDuration = duration > 0;
+
+  // Valeur affichée dans le minuteur :
+  // - avec durée : compte à rebours à partir de la durée choisie
+  // - sans durée : chronomètre qui démarre à 00:00
+  const displayedSeconds = hasDuration
+    ? Math.max(duration - elapsed, 0)
+    : elapsed;
 
   // Permissions caméra / micro
   const [camPerm, requestCamPerm] = useCameraPermissions();
   const [micPerm, requestMicPerm] = useMicrophonePermissions();
 
+  // Minuteur : avance d'une seconde tant qu'on enregistre
+  useEffect(() => {
+    if (!isRecording) return;
+    const id = setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => clearInterval(id);
+  }, [isRecording]);
+
+  // Arrêt automatique quand le compte à rebours atteint 0
+  useEffect(() => {
+    if (isRecording && hasDuration && elapsed >= duration) {
+      cameraRef.current?.stopRecording();
+    }
+  }, [elapsed, isRecording, hasDuration, duration]);
+
   const startRecording = async () => {
-    // L'enregistrement recordAsync n'est pas disponible sur le Web
+    // recordAsync n'est pas disponible sur le Web
     if (Platform.OS === "web") {
       alert("L'enregistrement vidéo sera disponible sur l'application mobile.");
       return;
     }
 
+    // On attend que la caméra soit prête et on évite un double départ
+    if (!cameraReady || isRecording || !cameraRef.current) return;
+
     try {
+      setElapsed(0);
       setRecording(true);
-
-      const video = await cameraRef.current?.recordAsync({
-        maxDuration: 9,
-      });
-
+      const video = await cameraRef.current.recordAsync(
+        hasDuration ? { maxDuration: duration } : undefined,
+      );
       console.log("Vidéo enregistrée :", video?.uri);
-    } catch (error) {
-      alert(error);
+    } catch (error: any) {
+      alert(error?.message ?? String(error));
     } finally {
       setRecording(false);
     }
@@ -66,22 +137,67 @@ export default function HomeScreen() {
   };
 
   // Chargement des permissions
-  if (!camPerm || !micPerm) return <View />;
+  if (!camPerm || !micPerm) return <View style={styles.center} />;
 
   if (!camPerm.granted || !micPerm.granted) {
+    const canAsk = camPerm.canAskAgain && micPerm.canAskAgain;
+
+    const handlePress = async () => {
+      if (!canAsk) {
+        Linking.openSettings();
+        return;
+      }
+      await requestCamPerm();
+      await requestMicPerm();
+    };
+
     return (
-      <View style={styles.center}>
-        <Text>Caméra et micro nécessaires.</Text>
+      <View
+        style={[
+          styles.center,
+          { paddingTop: insets.top, paddingBottom: insets.bottom },
+        ]}
+      >
+        <View style={styles.iconCircle}>
+          <Ionicons name="videocam" size={40} color={COLORS.primary} />
+        </View>
+
+        <Text style={styles.title}>Autorisations requises</Text>
+        <Text style={styles.subtitle}>
+          Pour enregistrer une vidéo avec le son, nous avons besoin d'accéder à
+          votre caméra et à votre micro.
+        </Text>
+
+        <View style={styles.permList}>
+          <PermissionRow
+            icon="camera-outline"
+            label="Caméra"
+            granted={camPerm.granted}
+          />
+          <PermissionRow
+            icon="mic-outline"
+            label="Micro"
+            granted={micPerm.granted}
+            isLast
+          />
+        </View>
 
         <TouchableOpacity
           style={styles.btn}
-          onPress={async () => {
-            await requestCamPerm();
-            await requestMicPerm();
-          }}
+          activeOpacity={0.85}
+          onPress={handlePress}
         >
-          <Text style={styles.btnText}>Autoriser</Text>
+          <Text style={styles.btnText}>
+            {canAsk ? "Autoriser l'accès" : "Ouvrir les réglages"}
+          </Text>
         </TouchableOpacity>
+
+        {!canAsk && (
+          <Text style={styles.hint}>
+            L'accès a été refusé. Activez-le dans les réglages de votre
+            appareil.
+          </Text>
+        )}
       </View>
     );
   }
@@ -94,6 +210,7 @@ export default function HomeScreen() {
         <View style={styles.mannequinStage}>
           <Mannequin3D />
         </View>
+
         {/* Petite caméra en haut à gauche */}
         <View style={[styles.camera, { top: insets.top + 12 }]}>
           <CameraView
@@ -101,13 +218,19 @@ export default function HomeScreen() {
             mode="video"
             facing="front"
             ref={cameraRef}
+            onCameraReady={() => setCameraReady(true)}
           />
         </View>
 
         {/* Minuteur */}
         <View style={[styles.times, { top: insets.top + 12 }]}>
-          <Text style={styles.timerText}>02:35</Text>
-          <View style={styles.redDot} />
+          <Text style={styles.timerText}>{formatTime(displayedSeconds)}</Text>
+          <View
+            style={[
+              styles.redDot,
+              !isRecording && { backgroundColor: COLORS.mutedLight },
+            ]}
+          />
         </View>
 
         {/* Graphique en bas */}
@@ -116,17 +239,13 @@ export default function HomeScreen() {
         </View>
       </View>
 
-      {/* Dégradé violet tout en bas */}
-      {/*
-      <LinearGradient
-        pointerEvents="none"
-        colors={["rgba(185, 184, 235, 0)", "#f4f4f8d0"]}
-        style={styles.bottomGlow}
-      />
-      */}
-
       {/* Barre du bas */}
-      <View style={styles.bottomBar}>
+      <View
+        style={[
+          styles.bottomBar,
+          { height: 140 + insets.bottom, paddingBottom: insets.bottom + 20 },
+        ]}
+      >
         {/* Retour */}
         <TouchableOpacity style={styles.bottomItem}>
           <View style={styles.sideCircle}>
@@ -145,14 +264,12 @@ export default function HomeScreen() {
               { top: 2, right: 14, transform: [{ rotate: "15deg" }] },
             ]}
           />
-
           <View
             style={[
               styles.spark,
               { top: 10, right: 2, transform: [{ rotate: "55deg" }] },
             ]}
           />
-
           <View
             style={[
               styles.spark,
@@ -171,19 +288,6 @@ export default function HomeScreen() {
               />
             </View>
           </LinearGradient>
-
-          {/*
-          <LinearGradient
-            colors={["#6B4BEF", "#4E2FC2"]}
-            start={{ x: 0, y: 0 }}
-            end={{ x: 1, y: 1 }}
-            style={styles.recordLabel}
-          >
-            <Text style={styles.bottomTextBold}>
-              {isRecording ? "Arrêter" : "Enregistrer"}
-            </Text>
-          </LinearGradient>
-          */}
         </TouchableOpacity>
 
         {/* Paramètres */}
@@ -198,11 +302,98 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
+  /* ---------- Écran de permissions ---------- */
   center: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
+    paddingHorizontal: 28,
+    backgroundColor: COLORS.background,
+  },
+
+  iconCircle: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    backgroundColor: COLORS.primary + "26", // ~15% d'opacité
+    justifyContent: "center",
+    alignItems: "center",
+    marginBottom: 24,
+  },
+
+  title: {
+    fontSize: 22,
+    fontWeight: "700",
+    textAlign: "center",
+    color: COLORS.textDark,
+    marginBottom: 8,
+  },
+
+  subtitle: {
+    fontSize: 15,
+    lineHeight: 22,
+    textAlign: "center",
+    color: COLORS.muted,
+    marginBottom: 28,
+  },
+
+  permList: {
+    width: "100%",
+    backgroundColor: COLORS.white,
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    marginBottom: 28,
+  },
+
+  permRow: {
+    flexDirection: "row",
+    alignItems: "center",
     gap: 12,
+    paddingVertical: 14,
+  },
+
+  permRowBorder: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: COLORS.pill,
+  },
+
+  permLabel: {
+    flex: 1,
+    fontSize: 16,
+    fontWeight: "500",
+    color: COLORS.textDark,
+  },
+
+  btn: {
+    width: "100%",
+    backgroundColor: COLORS.primary,
+    paddingVertical: 14,
+    borderRadius: 14,
+    alignItems: "center",
+    shadowColor: COLORS.primary,
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
+  },
+
+  btnText: {
+    color: COLORS.white,
+    fontSize: 16,
+    fontWeight: "600",
+  },
+
+  hint: {
+    marginTop: 16,
+    fontSize: 13,
+    textAlign: "center",
+    color: COLORS.mutedLight,
+  },
+
+  /* ---------- Écran principal ---------- */
+  container: {
+    flex: 1,
+    backgroundColor: COLORS.background,
   },
 
   mannequinStage: {
@@ -212,22 +403,6 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 180,
     overflow: "hidden",
-  },
-
-  container: {
-    flex: 1,
-    backgroundColor: COLORS.background,
-  },
-
-  btn: {
-    backgroundColor: COLORS.primary,
-    paddingVertical: 10,
-    paddingHorizontal: 20,
-    borderRadius: 10,
-  },
-
-  btnText: {
-    color: COLORS.white,
   },
 
   timerText: {
@@ -310,11 +485,11 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     height: 140,
-    paddingVertical: 80,
+    paddingBottom: 20,
     flexDirection: "row",
     justifyContent: "space-around",
     alignItems: "center",
-    backgroundColor: "#ffff",
+    backgroundColor: "#ffffff",
     shadowColor: "#000",
     shadowOffset: { width: 0, height: -4 },
     shadowOpacity: 0.25,
@@ -326,18 +501,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 6,
     marginBottom: 14,
-  },
-
-  bottomText: {
-    color: "#FFFFFF",
-    fontSize: 14,
-    fontWeight: "500",
-  },
-
-  bottomTextBold: {
-    color: "white",
-    fontSize: 12,
-    fontWeight: "bold",
   },
 
   recordWrapper: {
@@ -375,26 +538,11 @@ const styles = StyleSheet.create({
     elevation: 6,
   },
 
-  recordLabel: {
-    marginTop: 4,
-    paddingVertical: 6,
-    paddingHorizontal: 20,
-    borderRadius: 20,
-  },
-
   spark: {
     position: "absolute",
     width: 3,
     height: 12,
     borderRadius: 2,
     backgroundColor: COLORS.orange,
-  },
-
-  bottomGlow: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    bottom: 0,
-    height: 110,
   },
 });
